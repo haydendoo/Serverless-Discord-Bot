@@ -1,0 +1,26 @@
+[
+    {
+        "name": "upload",
+        "description": "Uploads a file. To specify folder/directory, use directory/filename.ext",
+        "options": [
+            {
+                "name": "file",
+                "description": "The file you want to upload",
+                "type": 11,
+                "required": true
+            }
+        ]
+    },
+    {
+        "name": "get",
+        "description": "Downloads a file. To specify folder/directory, use directory/filename.ext",
+        "options": [
+            {
+                "name": "filename",
+                "description": "The filename of the file you want to download",
+                "type": 3,
+                "required": true
+            }
+        ]
+    }
+]

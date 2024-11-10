@@ -1,37 +1,64 @@
 package main
 
 import (
-    "context"
     "fmt"
-    "log"
-
-    "github.com/aws/aws-sdk-go-v2/aws"
-    "github.com/aws/aws-sdk-go-v2/config"
-    "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+    "net/http"
+    "io/ioutil"
+    "encoding/json"
 )
 
+type Request struct {
+    Type int `json:"type"`
+    Data struct {
+        Name string `json:"name"`
+
+        Options []struct {
+            Value string `json:"value"`
+        } `json:"options"`
+
+    } `json:"data"`
+}
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "405 - Method Not Allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    body, err := ioutil.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "400 - Bad Request", http.StatusBadRequest)
+        return
+    }
+    defer r.Body.Close()
+    
+    var rData Request
+    err = json.Unmarshal(body, &rData)
+    if err != nil {
+        http.Error(w, "400 - Bad Request", http.StatusBadRequest)
+        return
+    }
+
+    if rData.Type == 1 {
+        response := map[string]int{
+            "type": 1,
+        }
+        w.Header().Set("Content-Type", "application/json")
+
+        if err := json.NewEncoder(w).Encode(response); err != nil {
+            http.Error(w, "Unable to encode JSON", http.StatusInternalServerError)
+        }
+        return
+    }
+}
+
 func main() {
-    // Using the SDK's default configuration, loading additional config
-    // and credentials values from the environment variables, shared
-    // credentials, and shared configuration files
-    cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-southeast-1"))
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", rootHandler)
+
+    fmt.Println("Starting server on port 2010...")
+    err := http.ListenAndServe(":2010", mux)
     if err != nil {
-        log.Fatalf("unable to load SDK config, %v", err)
-    }
-
-    // Using the Config value, create the DynamoDB client
-    svc := dynamodb.NewFromConfig(cfg)
-
-    // Build the request with its input parameters
-    resp, err := svc.ListTables(context.TODO(), &dynamodb.ListTablesInput{
-        Limit: aws.Int32(5),
-    })
-    if err != nil {
-        log.Fatalf("failed to list tables, %v", err)
-    }
-
-    fmt.Println("Tables:")
-    for _, tableName := range resp.TableNames {
-        fmt.Println(tableName)
+        panic(err)
     }
 }

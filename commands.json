@@ -1,5 +1,9 @@
 [
     {
+        "name": "ls",
+        "description": "List out all files in s3 bucket"
+    },
+    {
         "name": "upload",
         "description": "Uploads a file. To specify folder/directory, use directory/filename.ext",
         "options": [

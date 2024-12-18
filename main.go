@@ -1,57 +1,63 @@
 package main
 
 import (
+    "context"
     "fmt"
     "net/http"
+    "net/url"
     "io/ioutil"
     "encoding/json"
     "crypto/ed25519"
-	"encoding/hex"
+    "encoding/hex"
+    "mime/multipart"
     "log"
     "strings"
-	"path/filepath"
     "bytes"
     "io"
 
-    "github.com/aws/aws-sdk-go/aws"
-    "github.com/aws/aws-sdk-go/aws/session"
-    "github.com/aws/aws-sdk-go/service/s3"
+    "github.com/aws/aws-sdk-go-v2/aws"
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-func createS3Client() *s3.S3 {
-    sess, err := session.NewSession(&aws.Config{
-        Region: aws.String("ap-southeast-1"),
-    })
-    if err != nil {
-        log.Fatalf("Failed to create session: %v", err)
-    }
-    return s3.New(sess)
-}
-
-func uploadFile(svc *s3.S3, bucket string, file *bytes.Reader, key string) error {
-    _, err := svc.PutObject(&s3.PutObjectInput{
+func uploadFile(bucket string, file *bytes.Reader, key string) error {
+    _, err := svc.PutObject(context.TODO(), &s3.PutObjectInput{
         Bucket: aws.String(bucket),
         Key:    aws.String(key),
         Body:   file,
     })
     if err != nil {
-        return fmt.Errorf("failed to upload file, %v", err)
+        return err
     }
 
     fmt.Printf("File uploaded successfully to s3://%s/%s\n", bucket, key)
     return nil
 }
 
-func downloadFile(svc *s3.S3, bucket string, key string) error {
-    res, err := svc.GetObject(&s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-    return err
+func downloadFile(bucket string, key string) (*bytes.Buffer, string, error) {
+    res, err := svc.GetObject(context.TODO(), &s3.GetObjectInput{
+        Bucket: aws.String(bucket),
+        Key:    aws.String(key),
+    })
+    if err != nil {
+        return nil, "", err
+    }
+    defer res.Body.Close()
+
+    buffer := new(bytes.Buffer)
+    _, err = io.Copy(buffer, res.Body)
+    if err != nil {
+        return nil, "", err
+    }
+
+    fileName := key[strings.LastIndex(key, "/")+1:]
+    return buffer, fileName, nil
 }
 
 type Request struct {
     Type int `json:"type"`
+    ID string `json:"id"`
+    Token string `json:"token"`
     Data struct {
         Name string `json:"name"`
 
@@ -77,7 +83,10 @@ type Response struct {
     } `json:"data"`
 }
 
+var svc *s3.Client
+
 const PUBLIC_KEY = "6d60e10fd7a4c29556fbb804df4e943dade4f634ee2f27e79d92a477bce94690"
+const APP_ID = "1305095284774404116"
 
 func verifySignature(signatureHex, timestamp, body string) bool {
     publicKey, err := hex.DecodeString(PUBLIC_KEY)
@@ -87,9 +96,65 @@ func verifySignature(signatureHex, timestamp, body string) bool {
     signature, err := hex.DecodeString(signatureHex)
     if err != nil {
         return false
-    } 
+    }
     message := []byte(timestamp + body)
     return ed25519.Verify(publicKey, message, signature)
+}
+
+func acknowledge(url string) {
+    payload := map[string]interface{}{"type": 5}
+    body, _ := json.Marshal(payload)
+    http.Post(url, "application/json", bytes.NewBuffer(body))
+}
+
+func sendFileToDiscord(url string, fileBuffer *bytes.Buffer, fileName string) {
+    body := &bytes.Buffer{}
+    writer := multipart.NewWriter(body)
+
+    part, err := writer.CreateFormFile("file", fileName)
+    if err != nil {
+        fmt.Println("Error creating form file:", err)
+        return
+    }
+
+    _, err = io.Copy(part, fileBuffer)
+    if err != nil {
+        fmt.Println("Error writing file buffer:", err)
+        return
+    }
+    err = writer.WriteField("content", "Here is your file")
+    if err != nil {
+        fmt.Println("Error writing field:", err)
+        return
+    }
+
+    err = writer.Close()
+    if err != nil {
+        fmt.Println("Error closing writer:", err)
+        return
+    }
+
+    req, err := http.NewRequest("POST", url, body)
+    if err != nil {
+        fmt.Println("Error creating request:", err)
+        return
+    }
+
+    req.Header.Set("Content-Type", writer.FormDataContentType())
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        fmt.Println("Error sending request:", err)
+        return
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode == 200 {
+        fmt.Println("File sent successfully!")
+    } else {
+        fmt.Printf("Failed to send file, status code: %d\n", resp.StatusCode)
+    }
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
@@ -105,14 +170,13 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
     }
     defer r.Body.Close()
 
-    // Verify security headers
     signature := r.Header.Get("X-Signature-Ed25519")
     timestamp := r.Header.Get("X-Signature-Timestamp")
     if !verifySignature(signature, timestamp, string(body)) {
         http.Error(w, "Invalid request signature", http.StatusUnauthorized)
         return
     }
-    
+
     var rData Request
     err = json.Unmarshal(body, &rData)
     if err != nil {
@@ -120,7 +184,6 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Ping
     if rData.Type == 1 {
         response := map[string]int{
             "type": 1,
@@ -138,25 +201,65 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Create s3 client
-    svc := createS3Client()
-
-    // Json response
     w.Header().Set("Content-Type", "application/json")
-    if rData.Data.Name == "get" {
+
+    if rData.Data.Name == "ls" {
         res := Response{
             Type: 4,
         }
 
-        files := strings.Split(rData.Data.Options[0].Value, " ")
-        for _, file := range files {
-            file = filepath.Clean(file)
-
-            res.Data.Content += "* Successfully dowloaded " + file + "\n"
+        resp, err := svc.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		    Bucket: aws.String("nyi"),
+	    })
+        if err != nil {
+            log.Fatalf("Unable to list items in bucket nyi, %v", err)
         }
 
-        json.NewEncoder(w).Encode(res) 
+        res.Data.Content = "The files are included are:\n"
+        for _, item := range resp.Contents {
+            res.Data.Content += "* " + *item.Key + "\n"
+        }
+        json.NewEncoder(w).Encode(res)
         return
+    }
+
+    if rData.Data.Name == "get" {
+        responseURL := fmt.Sprintf("https://discord.com/api/v10/interactions/%s/%s/callback", rData.ID, rData.Token)
+        acknowledge(responseURL)
+
+        files := strings.Split(rData.Data.Options[0].Value, " ")
+        followUpURL := fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s", APP_ID, rData.Token)
+
+        for _, file := range files {
+            fileBuffer, fileName, err := downloadFile("nyi", file)
+            if err != nil {
+                log.Printf("Error fetching file from S3: %v", err)
+
+	            body := &bytes.Buffer{}
+	            data := url.Values{}
+	            data.Set("content", fmt.Sprintf("Could not find the file: %s", file))
+	            _, err := body.Write([]byte(data.Encode()))
+	            if err != nil {
+		            fmt.Println("Error writing body:", err)
+		            continue
+	            }
+                req, err := http.NewRequest("POST", followUpURL, body) 
+                if err != nil {
+		            fmt.Println("Error creating request:", err)
+                    continue
+	            }
+	            req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	            client := &http.Client{}
+	            resp, err := client.Do(req)
+	            if err != nil {
+		            fmt.Println("Error sending request:", err)
+                    continue
+	            }
+	            defer resp.Body.Close()
+                continue
+            }
+            sendFileToDiscord(followUpURL, fileBuffer, fileName)
+        }
     }
 
     if rData.Data.Name == "upload" {
@@ -168,14 +271,14 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
             }
 
             var buf bytes.Buffer
-	        _, err = io.Copy(&buf, res.Body)
-	        if err != nil {
+            _, err = io.Copy(&buf, res.Body)
+            if err != nil {
                 http.Error(w, "Error uploading file", http.StatusInternalServerError)
-		        return
-	        }
+                return
+            }
             defer res.Body.Close()
 
-            err = uploadFile(svc, "nyi", bytes.NewReader(buf.Bytes()), attachment.Filename)
+            err = uploadFile("nyi", bytes.NewReader(buf.Bytes()), attachment.Filename)
             if err != nil {
                 http.Error(w, "Error uploading file", http.StatusInternalServerError)
                 return
@@ -187,17 +290,25 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         }
 
         res.Data.Content = "Successfully uploaded files!"
-        json.NewEncoder(w).Encode(res) 
+        json.NewEncoder(w).Encode(res)
         return
     }
 }
 
 func main() {
+    cfg, err := config.LoadDefaultConfig(
+        context.TODO(),
+        config.WithRegion("ap-southeast-1"),
+    )
+    if err != nil {
+        log.Fatalf("unable to load SDK config, %v", err)
+    }
+    svc = s3.NewFromConfig(cfg)
     mux := http.NewServeMux()
     mux.HandleFunc("/", rootHandler)
 
     fmt.Println("Starting server on port 2010...")
-    err := http.ListenAndServe(":2010", mux)
+    err = http.ListenAndServe(":2010", mux)
     if err != nil {
         panic(err)
     }

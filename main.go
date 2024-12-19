@@ -5,7 +5,6 @@ import (
     "fmt"
     "net/http"
     "net/url"
-    "io/ioutil"
     "encoding/json"
     "crypto/ed25519"
     "encoding/hex"
@@ -18,6 +17,8 @@ import (
     "github.com/aws/aws-sdk-go-v2/aws"
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/aws/aws-lambda-go/lambda"
+    "github.com/aws/aws-lambda-go/events"
 )
 
 func uploadFile(bucket string, file *bytes.Reader, key string) error {
@@ -157,51 +158,54 @@ func sendFileToDiscord(url string, fileBuffer *bytes.Buffer, fileName string) {
     }
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, "405 - Method Not Allowed", http.StatusMethodNotAllowed)
-        return
-    }
+func rootHandler(r events.APIGatewayProxyRequest) (*events.APIGatewayProxyResponse, error) {
+    body := r.Body
+    signature := r.Headers["x-signature-ed25519"]
+    timestamp := r.Headers["x-signature-timestamp"]
 
-    body, err := ioutil.ReadAll(r.Body)
-    if err != nil {
-        http.Error(w, "400 - Bad Request", http.StatusBadRequest)
-        return
-    }
-    defer r.Body.Close()
-
-    signature := r.Header.Get("X-Signature-Ed25519")
-    timestamp := r.Header.Get("X-Signature-Timestamp")
-    if !verifySignature(signature, timestamp, string(body)) {
-        http.Error(w, "Invalid request signature", http.StatusUnauthorized)
-        return
+    if !verifySignature(signature, timestamp, body) {
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 401,
+            Body:       "Invalid request signature",
+        }, nil
     }
 
     var rData Request
-    err = json.Unmarshal(body, &rData)
+    err := json.Unmarshal([]byte(body), &rData)
     if err != nil {
-        http.Error(w, "400 - Bad Request", http.StatusBadRequest)
-        return
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 400,
+            Body:       "400 - Bad Request",
+        }, nil
     }
 
     if rData.Type == 1 {
         response := map[string]int{
             "type": 1,
         }
-        w.Header().Set("Content-Type", "application/json")
 
-        if err := json.NewEncoder(w).Encode(response); err != nil {
-            http.Error(w, "Unable to encode JSON", http.StatusInternalServerError)
+        responseBody, err := json.Marshal(response)
+        if err != nil {
+            return &events.APIGatewayProxyResponse{
+                StatusCode: 500,
+                Body:       "Unable to encode JSON",
+            }, nil
         }
-        return
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 200,
+            Body:       string(responseBody),
+            Headers: map[string]string{
+                "Content-Type": "application/json",
+            },
+        }, nil
     }
 
     if rData.Type != 2 {
-        http.Error(w, "Unsupported interaction", http.StatusBadRequest)
-        return
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 400,
+            Body:       "Unsupported interaction",
+        }, nil
     }
-
-    w.Header().Set("Content-Type", "application/json")
 
     if rData.Data.Name == "ls" {
         res := Response{
@@ -217,10 +221,22 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
         res.Data.Content = "The files are included are:\n"
         for _, item := range resp.Contents {
-            res.Data.Content += "* " + *item.Key + "\n"
+            res.Data.Content += "* ```" + *item.Key + "```\n"
         }
-        json.NewEncoder(w).Encode(res)
-        return
+        responseBody, err := json.Marshal(res)
+        if err != nil {
+            return &events.APIGatewayProxyResponse{
+                StatusCode: 500,
+                Body:       "Unable to encode response JSON",
+            }, nil
+        }
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 200,
+            Body:       string(responseBody),
+            Headers: map[string]string{
+                "Content-Type": "application/json",
+            },
+        }, nil
     }
 
     if rData.Data.Name == "get" {
@@ -266,22 +282,28 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         for _, attachment := range rData.Data.Resolved.Attachments {
             res, err := http.Get(attachment.Url)
             if err != nil {
-                http.Error(w, "Error uploading file", http.StatusInternalServerError)
-                return
+                return &events.APIGatewayProxyResponse{
+                    StatusCode: 500,
+                    Body:       "Error uploading file",
+                }, nil
             }
 
             var buf bytes.Buffer
             _, err = io.Copy(&buf, res.Body)
             if err != nil {
-                http.Error(w, "Error uploading file", http.StatusInternalServerError)
-                return
+                return &events.APIGatewayProxyResponse{
+                    StatusCode: 500,
+                    Body:       "Error uploading file",
+                }, nil
             }
             defer res.Body.Close()
 
             err = uploadFile("nyi", bytes.NewReader(buf.Bytes()), attachment.Filename)
             if err != nil {
-                http.Error(w, "Error uploading file", http.StatusInternalServerError)
-                return
+                return &events.APIGatewayProxyResponse{
+                    StatusCode: 500,
+                    Body:       "Error uploading file",
+                }, nil
             }
         }
 
@@ -290,9 +312,25 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
         }
 
         res.Data.Content = "Successfully uploaded files!"
-        json.NewEncoder(w).Encode(res)
-        return
+        responseBody, err := json.Marshal(res)
+        if err != nil {
+            return &events.APIGatewayProxyResponse{
+                StatusCode: 500,
+                Body:       "Unable to encode response JSON",
+            }, nil
+        }
+        return &events.APIGatewayProxyResponse{
+            StatusCode: 200,
+            Body:       string(responseBody),
+            Headers: map[string]string{
+                "Content-Type": "application/json",
+            },
+        }, nil
     }
+    return &events.APIGatewayProxyResponse{
+        StatusCode: 400,
+        Body:       "Bad request",
+    }, nil
 }
 
 func main() {
@@ -304,12 +342,6 @@ func main() {
         log.Fatalf("unable to load SDK config, %v", err)
     }
     svc = s3.NewFromConfig(cfg)
-    mux := http.NewServeMux()
-    mux.HandleFunc("/", rootHandler)
 
-    fmt.Println("Starting server on port 2010...")
-    err = http.ListenAndServe(":2010", mux)
-    if err != nil {
-        panic(err)
-    }
+    lambda.Start(rootHandler)
 }
